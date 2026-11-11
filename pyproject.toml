@@ -1,0 +1,29 @@
+[project]
+name = "actual-mcp"
+version = "0.1.0"
+description = "FastMCP server for Actual Budget in Python"
+readme = "README.md"
+authors = [
+    { name = "ResistorCat" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "actualpy>=0.16.0",
+    "fastmcp>=4.0.0",
+    "pydantic-settings>=2.8.0",
+    "uvicorn>=0.34.0",
+]
+
+[project.scripts]
+actual-mcp = "actual_mcp.server:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+    "ruff>=0.17.4",
+]

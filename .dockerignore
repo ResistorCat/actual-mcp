@@ -1,0 +1,14 @@
+.git
+.gitignore
+.cloudflare
+.venv
+data
+/data
+__pycache__
+*.pyc
+.env
+.env.*
+!.env.example
+.pytest_cache
+.ruff_cache
+tests

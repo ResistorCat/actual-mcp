@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+*.sqlite
+*.sqlite-journal
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Local cache & data
+data/
+/data/
+.cloudflare/
+.pytest_cache/
+.ruff_cache/
