@@ -14,6 +14,7 @@ from actual_mcp.client import (
     ActualBudgetClient,
     is_valid_uuid,
     resolve_account,
+    resolve_budget_file,
     resolve_category,
     resolve_payee,
 )
@@ -242,3 +243,30 @@ def test_client_unconfigured_error():
     # Settings default is unconfigured when password and file are empty
     with pytest.raises(ValueError, match="Actual Budget credentials are not fully configured"):
         c._get_actual()
+
+
+def test_resolve_budget_file():
+    from actual import RemoteFileListDTO
+
+    f1 = RemoteFileListDTO(name="My Finances", fileId="uuid-1", groupId="sync-1", encryptKeyId=None, deleted=0)
+    f2 = RemoteFileListDTO(name="Business", fileId="uuid-2", groupId="sync-2", encryptKeyId=None, deleted=0)
+
+    # 1. Exact match by name
+    assert resolve_budget_file("My Finances", [f1, f2]).name == "My Finances"
+    # 2. Exact match by file_id
+    assert resolve_budget_file("uuid-2", [f1, f2]).name == "Business"
+    # 3. Case-insensitive match
+    assert resolve_budget_file("business", [f1, f2]).name == "Business"
+    # 4. Normalized slug match
+    assert resolve_budget_file("My-Finances-af43811", [f1, f2]).name == "My Finances"
+    # 5. Single active file auto-selection
+    assert resolve_budget_file("", [f1]).name == "My Finances"
+    assert resolve_budget_file("unknown-slug", [f1]).name == "My Finances"
+
+    # 6. Not found with multiple files
+    with pytest.raises(ValueError, match="Could not find budget 'Nonexistent'"):
+        resolve_budget_file("Nonexistent", [f1, f2])
+
+    # 7. No active files
+    with pytest.raises(ValueError, match="No active budget files found"):
+        resolve_budget_file("any", [])

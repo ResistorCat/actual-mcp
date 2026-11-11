@@ -112,6 +112,48 @@ def parse_month(month_str: str | None) -> datetime.date:
     return datetime.date.fromisoformat(month_str).replace(day=1)
 
 
+def resolve_budget_file(target: str, user_files: list[Any]) -> Any:
+    """Resolves target file identifier against remote budget files.
+
+    Supports exact file_id/name/group_id, case-insensitive name, normalized slug matching,
+    or automatic fallback to the single active budget on the server.
+    """
+    active_files = [f for f in user_files if getattr(f, "deleted", 0) == 0]
+    target_clean = (target or "").strip()
+
+    if target_clean:
+        # 1. Exact match by file_id, name, or group_id
+        for f in active_files:
+            if f.file_id == target_clean or f.name == target_clean or f.group_id == target_clean:
+                return f
+        # 2. Case-insensitive match on name
+        for f in active_files:
+            if f.name.lower() == target_clean.lower():
+                return f
+        # 3. Normalized slug / substring match (e.g. 'My-Finances-af43811' matching 'My Finances')
+        norm_target = target_clean.replace("-", " ").lower()
+        for f in active_files:
+            if f.name.lower() in norm_target or norm_target in f.name.lower():
+                return f
+
+    # 4. Fallback: if only 1 active budget exists, auto-select it
+    if len(active_files) == 1:
+        logger.info(
+            "Auto-selecting single available budget file: '%s' (id: %s)",
+            active_files[0].name,
+            active_files[0].file_id,
+        )
+        return active_files[0]
+
+    if not active_files:
+        raise ValueError("No active budget files found on Actual server.")
+
+    available = [f"'{f.name}' (id: {f.file_id})" for f in active_files]
+    raise ValueError(
+        f"Could not find budget '{target_clean}'. Available budgets on server: {available}"
+    )
+
+
 class ActualBudgetClient:
     """Thread-safe client wrapping actualpy with session caching and sync/commit handling."""
 
@@ -126,20 +168,25 @@ class ActualBudgetClient:
         if not settings.is_configured:
             raise ValueError(
                 "Actual Budget credentials are not fully configured. "
-                "Ensure ACTUAL_PASSWORD and ACTUAL_FILE are set."
+                "Ensure ACTUAL_PASSWORD is set."
             )
 
         settings.actual_data_dir.mkdir(parents=True, exist_ok=True)
-        self._actual = Actual(
+        actual = Actual(
             base_url=settings.actual_url,
             password=settings.actual_password,
-            file=settings.actual_file,
+            file=None,
             encryption_password=settings.actual_encryption_password,
             data_dir=settings.actual_data_dir,
             cert=settings.actual_verify_ssl,
             extra_headers=settings.extra_headers,
         )
-        self._actual.__enter__()
+
+        remote_files = actual.list_user_files().data
+        selected_file = resolve_budget_file(settings.actual_file, remote_files)
+        actual.set_file(selected_file)
+        actual.__enter__()
+        self._actual = actual
         return self._actual
 
     def close(self) -> None:

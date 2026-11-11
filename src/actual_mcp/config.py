@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     @property
     def is_configured(self) -> bool:
         """Returns True if the required Actual Budget credentials are set."""
-        return bool(self.actual_password and self.actual_file)
+        return bool(self.actual_password)
 
     @property
     def extra_headers(self) -> dict[str, str] | None:
