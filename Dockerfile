@@ -9,8 +9,8 @@ ENV UV_COMPILE_BYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=8000
 
-# Install curl for container health checks
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+# Install curl and wget for container health checks
+RUN apt-get update && apt-get install -y --no-install-recommends curl wget && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies using cached mount
 RUN --mount=type=cache,target=/root/.cache/uv \
