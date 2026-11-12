@@ -30,6 +30,18 @@ def memory_db():
         yield session
 
 
+@pytest.fixture
+def mock_client(memory_db: Session) -> ActualBudgetClient:
+    mock_actual = MagicMock()
+    mock_actual.session = memory_db
+    mock_actual.sync = MagicMock()
+    mock_actual.commit = MagicMock()
+
+    c = ActualBudgetClient()
+    c._actual = mock_actual
+    return c
+
+
 def test_settings_properties():
     s = Settings(
         actual_password="test-password",
@@ -55,9 +67,9 @@ def test_uuid_validation():
 
 
 def test_resolve_entities(memory_db: Session):
-    account = Accounts(id="acc-uuid-1", name="Checking", closed=0, offbudget=0)
-    cat_group = CategoryGroups(id="grp-1", name="Food", is_income=0, hidden=False, sort_order=0)
-    category = Categories(id="cat-uuid-1", name="Groceries", tombstone=0, cat_group=cat_group.id)
+    account = Accounts(id="acc-uuid-1", name="Checking", closed=0, offbudget=0, tombstone=0)
+    cat_group = CategoryGroups(id="grp-1", name="Food", is_income=0, hidden=False, sort_order=0, tombstone=0)
+    category = Categories(id="cat-uuid-1", name="Groceries", tombstone=0, cat_group=cat_group.id, hidden=False)
     payee = Payees(id="pay-uuid-1", name="Supermarket", tombstone=0)
 
     memory_db.add_all([account, cat_group, category, payee])
@@ -138,35 +150,54 @@ async def test_mcp_tools_registered():
     tool_names = {t.name for t in tools}
     expected_tools = {
         "get_accounts",
+        "create_account",
+        "update_account",
+        "close_account",
+        "get_account_balance",
+        "reconcile_account",
         "get_categories",
+        "create_category",
+        "update_category",
+        "delete_category",
+        "create_category_group",
+        "update_category_group",
+        "delete_category_group",
+        "get_payees",
+        "create_payee",
+        "update_payee",
+        "delete_payee",
+        "merge_payees",
         "get_budget_month",
+        "set_budget_amount",
         "get_transactions",
         "create_transaction",
         "update_transaction",
         "delete_transaction",
-        "set_budget_amount",
+        "create_transfer",
+        "import_transactions",
         "sync_budget",
     }
     assert expected_tools.issubset(tool_names)
 
 
-def test_client_crud_operations(memory_db: Session):
-    acct = Accounts(id="acc-test", name="Wallet", closed=0, offbudget=0)
-    cat = Categories(id="cat-test", name="Snacks", tombstone=0)
-    memory_db.add_all([acct, cat])
-    memory_db.commit()
+def test_client_crud_pagination_and_aggregations(mock_client: ActualBudgetClient):
+    c = mock_client
+    c.create_account(name="Wallet", initial_balance=0.0)
+    c.create_account(name="Savings", initial_balance=0.0)
+    c.create_category(name="Snacks", group="Food")
+    c.create_category(name="Salary", group="Income", is_income=True)
 
-    # Mock Actual instance
-    mock_actual = MagicMock()
-    mock_actual.session = memory_db
-    mock_actual.sync = MagicMock()
-    mock_actual.commit = MagicMock()
-
-    c = ActualBudgetClient()
-    c._actual = mock_actual
-
-    # 1. Add transaction
-    tx_dict = c.add_transaction(
+    # 1. Add transactions across months and categories
+    tx1 = c.add_transaction(
+        date="2026-10-15",
+        account="Wallet",
+        amount=1000.00,
+        payee="Employer",
+        category="Salary",
+        notes="October paycheck",
+        cleared=True,
+    )
+    tx2 = c.add_transaction(
         date="2026-11-10",
         account="Wallet",
         amount=-15.75,
@@ -175,72 +206,381 @@ def test_client_crud_operations(memory_db: Session):
         notes="Coffee and pastry",
         cleared=True,
     )
-    assert tx_dict["amount"] == -15.75
-    assert tx_dict["account_name"] == "Wallet"
-    assert tx_dict["notes"] == "Coffee and pastry"
-    assert tx_dict["cleared"] is True
-    assert mock_actual.commit.call_count == 1
-
-    tx_id = tx_dict["id"]
-
-    # 2. List transactions
-    txs = c.list_transactions(account="Wallet")
-    assert len(txs) == 1
-    assert txs[0]["id"] == tx_id
-    assert txs[0]["amount"] == -15.75
-
-    # 3. Update transaction
-    updated = c.update_transaction(
-        transaction_id=tx_id,
-        amount=-18.00,
-        notes="Updated note",
+    tx3 = c.add_transaction(
+        date="2026-11-11",
+        account="Wallet",
+        amount=-24.25,
+        payee="Supermarket",
+        category="Snacks",
+        notes="Cookies",
+        cleared=False,
     )
-    assert updated["amount"] == -18.00
-    assert updated["notes"] == "Updated note"
+
+    assert tx2["amount"] == -15.75
+    assert tx2["account_name"] == "Wallet"
+    assert tx2["cleared"] is True
+
+    # 2. List transactions with pagination & check aggregations
+    page1 = c.list_transactions(account="Wallet", offset=0, limit=2)
+    assert page1["total"] == 3
+    assert page1["offset"] == 0
+    assert page1["limit"] == 2
+    assert page1["has_more"] is True
+    assert len(page1["transactions"]) == 2
+
+    page2 = c.list_transactions(account="Wallet", offset=2, limit=2)
+    assert page2["has_more"] is False
+    assert len(page2["transactions"]) == 1
+
+    # Verify by_category totals (aggregated across all 3 matching transactions)
+    by_cat = {item["category_name"]: item for item in page1["by_category"]}
+    assert by_cat["Salary"]["total_amount"] == 1000.00
+    assert by_cat["Salary"]["count"] == 1
+    assert by_cat["Snacks"]["total_amount"] == -40.00
+    assert by_cat["Snacks"]["count"] == 2
+
+    # Verify by_month totals
+    by_month = {item["month"]: item for item in page1["by_month"]}
+    assert by_month["2026-10"]["income"] == 1000.00
+    assert by_month["2026-10"]["expenses"] == 0.00
+    assert by_month["2026-11"]["expenses"] == -40.00
+    assert by_month["2026-11"]["net"] == -40.00
+
+    # 3. Update transaction including moving to another account and marking reconciled
+    updated = c.update_transaction(
+        transaction_id=tx3["id"],
+        account="Savings",
+        amount=-30.00,
+        notes="Moved to Savings",
+        reconciled=True,
+    )
+    assert updated["amount"] == -30.00
+    assert updated["account_name"] == "Savings"
+    assert updated["reconciled"] is True
+
+    # Confirm Wallet now only has 2 transactions
+    wallet_res = c.list_transactions(account="Wallet")
+    assert wallet_res["total"] == 2
 
     # 4. Delete transaction
-    del_res = c.delete_transaction(transaction_id=tx_id)
+    del_res = c.delete_transaction(transaction_id=tx1["id"])
     assert del_res["status"] == "deleted"
 
-    # Confirm deleted transactions are filtered out in listing
-    remaining = c.list_transactions(account="Wallet")
-    assert len(remaining) == 0
+
+def test_account_lifecycle_and_close_transfer(mock_client: ActualBudgetClient):
+    c = mock_client
+    acct1 = c.create_account(name="Checking", initial_balance=250.0, off_budget=False)
+    acct2 = c.create_account(name="Brokerage", initial_balance=0.0, off_budget=True)
+
+    assert acct1["balance"] == 250.0
+    assert acct1["offbudget"] is False
+    assert acct2["offbudget"] is True
+
+    # Duplicate account creation fails
+    with pytest.raises(ValueError, match="already exists"):
+        c.create_account(name="checking")
+
+    # Update account name and off_budget status
+    updated = c.update_account(account="Checking", name="Main Checking", off_budget=True)
+    assert updated["name"] == "Main Checking"
+    assert updated["offbudget"] is True
+
+    # Closing account with non-zero balance without transfer_account or force raises ValueError
+    with pytest.raises(ValueError, match="non-zero balance"):
+        c.close_account(account="Main Checking")
+
+    # Closing account with transfer_account moves balance to Brokerage and closes Main Checking
+    closed = c.close_account(account="Main Checking", transfer_account="Brokerage")
+    assert closed["closed"] is True
+    assert closed["balance"] == 0.0
+    assert closed["transfer_transaction_id"] is not None
+
+    brokerage_bal = c.get_account_balance(account="Brokerage")
+    assert brokerage_bal["balance"] == 250.0
 
 
-def test_client_categories_and_accounts(memory_db: Session):
-    acct_active = Accounts(id="acc-act", name="Active Account", closed=0, offbudget=0)
-    acct_closed = Accounts(id="acc-cls", name="Old Account", closed=1, offbudget=0)
-    grp = CategoryGroups(id="grp-exp", name="Monthly Expenses", is_income=0, hidden=False, sort_order=0)
-    cat = Categories(id="cat-rent", name="Rent", tombstone=0, cat_group=grp.id)
+def test_transfers_between_accounts(mock_client: ActualBudgetClient):
+    c = mock_client
+    c.create_account(name="Checking", initial_balance=500.0)
+    c.create_account(name="Savings", initial_balance=100.0)
 
-    memory_db.add_all([acct_active, acct_closed, grp, cat])
-    memory_db.commit()
+    tr = c.add_transfer(
+        date="2026-11-12",
+        source_account="Checking",
+        dest_account="Savings",
+        amount=150.0,
+        notes="Monthly savings transfer",
+        cleared=True,
+    )
+    src_tx = tr["source_transaction"]
+    dst_tx = tr["dest_transaction"]
 
-    mock_actual = MagicMock()
-    mock_actual.session = memory_db
-    mock_actual.sync = MagicMock()
+    assert src_tx["amount"] == -150.0
+    assert dst_tx["amount"] == 150.0
+    assert src_tx["transferred_id"] == dst_tx["id"]
+    assert dst_tx["transferred_id"] == src_tx["id"]
 
-    c = ActualBudgetClient()
-    c._actual = mock_actual
+    assert c.get_account_balance("Checking")["balance"] == 350.0
+    assert c.get_account_balance("Savings")["balance"] == 250.0
 
-    # Test list accounts
-    accounts_active = c.list_accounts(include_closed=False)
-    assert len(accounts_active) == 1
-    assert accounts_active[0]["name"] == "Active Account"
+    # Updating amount on source transaction updates peer transaction automatically
+    c.update_transaction(transaction_id=src_tx["id"], amount=-200.0)
+    assert c.get_account_balance("Checking")["balance"] == 300.0
+    assert c.get_account_balance("Savings")["balance"] == 300.0
 
-    accounts_all = c.list_accounts(include_closed=True)
-    assert len(accounts_all) == 2
+    # Deleting source transaction deletes peer transaction too
+    del_res = c.delete_transaction(transaction_id=src_tx["id"])
+    assert del_res["deleted_transfer_peer_id"] == dst_tx["id"]
+    assert c.get_account_balance("Checking")["balance"] == 500.0
+    assert c.get_account_balance("Savings")["balance"] == 100.0
 
-    # Test list categories
-    categories = c.list_categories(include_income=True)
-    assert len(categories) >= 1
-    assert any(g["group_name"] == "Monthly Expenses" for g in categories)
+
+def test_bulk_import_with_deduplication(mock_client: ActualBudgetClient):
+    c = mock_client
+    c.create_account(name="Credit Card")
+    c.create_category(name="Dining", group="Food")
+
+    # Pre-existing manual transaction without imported_id
+    c.add_transaction(
+        date="2026-11-05",
+        account="Credit Card",
+        amount=-42.50,
+        payee="Bistro",
+        notes="Manual entry",
+        cleared=False,
+    )
+
+    batch = [
+        # 1. Should fuzzy-match the existing Bistro transaction (within 7 days, same amount & payee)
+        {
+            "date": "2026-11-06",
+            "amount": -42.50,
+            "payee": "Bistro",
+            "category": "Dining",
+            "imported_id": "bank-tx-001",
+            "cleared": True,
+        },
+        # 2. Twin transaction #1 on same day
+        {
+            "date": "2026-11-08",
+            "amount": -5.00,
+            "payee": "Metro",
+            "imported_id": "bank-tx-002",
+            "cleared": True,
+        },
+        # 3. Twin transaction #2 on same day (must NOT deduplicate against #1 in the same batch)
+        {
+            "date": "2026-11-08",
+            "amount": -5.00,
+            "payee": "Metro",
+            "imported_id": "bank-tx-003",
+            "cleared": True,
+        },
+    ]
+
+    res1 = c.import_transactions(account="Credit Card", transactions=batch, deduplicate=True)
+    assert res1["total_processed"] == 3
+    assert res1["matched_count"] == 1
+    assert res1["created_count"] == 2
+
+    # Re-importing the exact same batch should match all 3 and create 0
+    res2 = c.import_transactions(account="Credit Card", transactions=batch, deduplicate=True)
+    assert res2["matched_count"] == 3
+    assert res2["created_count"] == 0
+
+    all_txs = c.list_transactions(account="Credit Card")
+    assert all_txs["total"] == 3
+
+
+def test_reconciliation_and_balance_as_of_date(mock_client: ActualBudgetClient):
+    c = mock_client
+    c.create_account(name="Bank")
+
+    c.add_transaction(
+        date="2026-11-01",
+        account="Bank",
+        amount=1000.0,
+        payee="Deposit",
+        cleared=True,
+    )
+    c.add_transaction(
+        date="2026-11-05",
+        account="Bank",
+        amount=-200.0,
+        payee="Rent",
+        cleared=True,
+    )
+    c.add_transaction(
+        date="2026-11-10",
+        account="Bank",
+        amount=-50.0,
+        payee="Pending Check",
+        cleared=False,
+    )
+    c.add_transaction(
+        date="2026-11-20",
+        account="Bank",
+        amount=-100.0,
+        payee="Future Bill",
+        cleared=True,
+    )
+
+    # Check balance as of 2026-11-12 (excludes 2026-11-20 transaction)
+    bal = c.get_account_balance(account="Bank", as_of_date="2026-11-12")
+    assert bal["balance"] == 750.0  # 1000 - 200 - 50
+    assert bal["cleared_balance"] == 800.0  # 1000 - 200
+    assert bal["uncleared_balance"] == -50.0
+    assert bal["reconciled_balance"] == 0.0
+    assert bal["unreconciled_cleared_count"] == 2
+
+    # Reconcile as of 2026-11-12 to a statement target balance of 785.0 (creates -15.0 adjustment)
+    rec = c.reconcile_account(
+        account="Bank",
+        target_balance=785.0,
+        as_of_date="2026-11-12",
+        create_adjustment=True,
+        mark_reconciled=True,
+    )
+    assert rec["previous_cleared_balance"] == 800.0
+    assert rec["difference"] == -15.0
+    assert rec["cleared_balance"] == 785.0
+    assert rec["adjustment_transaction"] is not None
+    assert rec["adjustment_transaction"]["amount"] == -15.0
+    assert rec["adjustment_transaction"]["reconciled"] is True
+
+    # Verify reconciled balance as of 2026-11-12 is now 785.0 and unreconciled_cleared_count is 0
+    bal_after = c.get_account_balance(account="Bank", as_of_date="2026-11-12")
+    assert bal_after["reconciled_balance"] == 785.0
+    assert bal_after["unreconciled_cleared_count"] == 0
+
+
+def test_categories_groups_and_payees_management(mock_client: ActualBudgetClient):
+    c = mock_client
+    c.create_account(name="Cash")
+
+    # Category Groups CRUD
+    grp = c.create_category_group(name="Housing", is_income=False)
+    assert grp["group_name"] == "Housing"
+
+    grp_upd = c.update_category_group(group=grp["group_id"], name="Home & Utilities", hidden=True)
+    assert grp_upd["group_name"] == "Home & Utilities"
+    assert grp_upd["hidden"] is True
+
+    # Categories CRUD + reassignment on delete
+    cat1 = c.create_category(name="Electricity", group="Home & Utilities")
+    c.create_category(name="General Bills", group="Home & Utilities")
+
+    tx = c.add_transaction(
+        date="2026-11-03",
+        account="Cash",
+        amount=-60.0,
+        payee="Power Co Grid",
+        category="Electricity",
+    )
+
+    cat1_upd = c.update_category(category=cat1["id"], name="Power Bill", hidden=True)
+    assert cat1_upd["name"] == "Power Bill"
+    assert cat1_upd["hidden"] is True
+
+    del_cat = c.delete_category(category="Power Bill", transfer_to_category="General Bills")
+    assert del_cat["reassigned_transactions"] == 1
+
+    txs = c.list_transactions(account="Cash")["transactions"]
+    assert txs[0]["id"] == tx["id"]
+    assert txs[0]["category_name"] == "General Bills"
+
+    # Payees CRUD & Merge
+    p1 = c.create_payee(name="Power Co Legacy")
+    p2 = c.create_payee(name="Power Company", favorite=True)
+    assert p2["favorite"] is True
+
+    c.add_transaction(
+        date="2026-11-04",
+        account="Cash",
+        amount=-70.0,
+        payee="Power Co Legacy",
+        category="General Bills",
+    )
+
+    merge_res = c.merge_payees(
+        target_payee="Power Company",
+        source_payees=["Power Co Grid", p1["id"]],
+    )
+    assert merge_res["reassigned_transactions"] == 2
+    assert len(merge_res["merged_payee_ids"]) == 2
+
+    payees = c.list_payees()
+    payee_names = {p["name"] for p in payees}
+    assert "Power Company" in payee_names
+    assert "Power Co Legacy" not in payee_names
+    assert "Power Co Grid" not in payee_names
+
+
+def test_split_transactions_create_and_update(mock_client: ActualBudgetClient):
+    c = mock_client
+    c.create_account(name="Checking")
+    c.create_category(name="Groceries", group="Living")
+    c.create_category(name="Household", group="Living")
+    c.create_category(name="Pharmacy", group="Living")
+
+    # Mismatched split sum raises ValueError
+    with pytest.raises(ValueError, match="does not match the sum of splits"):
+        c.add_transaction(
+            date="2026-11-10",
+            account="Checking",
+            amount=-100.0,
+            payee="Target",
+            splits=[
+                {"amount": -60.0, "category": "Groceries"},
+                {"amount": -30.0, "category": "Household"},
+            ],
+        )
+
+    # Create valid split transaction
+    parent = c.add_transaction(
+        date="2026-11-10",
+        account="Checking",
+        amount=-100.0,
+        payee="Target",
+        notes="Weekly shopping",
+        cleared=True,
+        splits=[
+            {"amount": -65.0, "category": "Groceries", "notes": "Food items"},
+            {"amount": -35.0, "category": "Household", "notes": "Detergent"},
+        ],
+    )
+    assert parent["is_parent"] is True
+    assert parent["amount"] == -100.0
+    assert len(parent["splits"]) == 2
+
+    # Account balance reflects exact split sum (-100.0) without double counting parent
+    bal = c.get_account_balance("Checking")
+    assert bal["balance"] == -100.0
+
+    # List transactions aggregates child splits accurately by category
+    listed = c.list_transactions(account="Checking")
+    assert listed["total"] == 2
+    by_cat = {c_item["category_name"]: c_item["total_amount"] for c_item in listed["by_category"]}
+    assert by_cat == {"Groceries": -65.0, "Household": -35.0}
+
+    # Update split transaction with new 3-way split
+    updated_parent = c.update_transaction(
+        transaction_id=parent["id"],
+        amount=-120.0,
+        splits=[
+            {"amount": -50.0, "category": "Groceries"},
+            {"amount": -40.0, "category": "Household"},
+            {"amount": -30.0, "category": "Pharmacy"},
+        ],
+    )
+    assert updated_parent["amount"] == -120.0
+    assert len(updated_parent["splits"]) == 3
+    assert c.get_account_balance("Checking")["balance"] == -120.0
 
 
 def test_client_unconfigured_error():
     c = ActualBudgetClient()
     c._actual = None
-    # Settings default is unconfigured when password and file are empty
     with pytest.raises(ValueError, match="Actual Budget credentials are not fully configured"):
         c._get_actual()
 
@@ -248,25 +588,22 @@ def test_client_unconfigured_error():
 def test_resolve_budget_file():
     from actual import RemoteFileListDTO
 
-    f1 = RemoteFileListDTO(name="My Finances", fileId="uuid-1", groupId="sync-1", encryptKeyId=None, deleted=0)
-    f2 = RemoteFileListDTO(name="Business", fileId="uuid-2", groupId="sync-2", encryptKeyId=None, deleted=0)
+    f1 = RemoteFileListDTO(
+        name="My Finances", fileId="uuid-1", groupId="sync-1", encryptKeyId=None, deleted=0
+    )
+    f2 = RemoteFileListDTO(
+        name="Business", fileId="uuid-2", groupId="sync-2", encryptKeyId=None, deleted=0
+    )
 
-    # 1. Exact match by name
     assert resolve_budget_file("My Finances", [f1, f2]).name == "My Finances"
-    # 2. Exact match by file_id
     assert resolve_budget_file("uuid-2", [f1, f2]).name == "Business"
-    # 3. Case-insensitive match
     assert resolve_budget_file("business", [f1, f2]).name == "Business"
-    # 4. Normalized slug match
     assert resolve_budget_file("My-Finances-af43811", [f1, f2]).name == "My Finances"
-    # 5. Single active file auto-selection
     assert resolve_budget_file("", [f1]).name == "My Finances"
     assert resolve_budget_file("unknown-slug", [f1]).name == "My Finances"
 
-    # 6. Not found with multiple files
     with pytest.raises(ValueError, match="Could not find budget 'Nonexistent'"):
         resolve_budget_file("Nonexistent", [f1, f2])
 
-    # 7. No active files
     with pytest.raises(ValueError, match="No active budget files found"):
         resolve_budget_file("any", [])

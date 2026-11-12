@@ -12,16 +12,29 @@ Designed for deployment on Docker / Coolify with built-in Bearer authentication,
 - **Authentication**: Bearer token authentication via `StaticTokenVerifier` (optional via `MCP_API_KEY`).
 - **Health Checks**: Public unauthenticated `/health` endpoint for Docker/Coolify/Traefik probes.
 - **Zero-Latency Read Cache**: Incremental synchronization with Actual Budget server using local SQLite storage (`/data`).
-- **Comprehensive Budget & Transaction Tools**:
-  - `get_accounts`: List accounts (checking, savings, credit cards, investments) and their balances.
-  - `get_categories`: List budget categories grouped by category group.
-  - `get_budget_month`: Monthly budget breakdown (budgeted, spent, and available balances).
-  - `get_transactions`: Search and filter transactions by date range, account, category, notes, and limits.
-  - `create_transaction`: Register new expenses (negative) or income (positive) with payee and category resolution.
-  - `update_transaction`: Update date, amount, payee, category, notes, or cleared status.
-  - `delete_transaction`: Soft-delete (tombstone) transactions and sync with Actual.
-  - `set_budget_amount`: Assign or update monthly budget allocations.
-  - `sync_budget`: Force an immediate incremental sync.
+- **Comprehensive Budget, Account & Transaction Tools**:
+  - **Accounts & Reconciliation**:
+    - `get_accounts`: List accounts (checking, savings, credit cards, investments) and their balances.
+    - `create_account`: Create on-budget or off-budget accounts with an optional initial balance.
+    - `update_account`: Rename accounts, toggle `off_budget`, or reopen/close accounts.
+    - `close_account`: Close an account and optionally transfer any remaining balance to another account.
+    - `get_account_balance`: Get total, cleared, reconciled, and uncleared balances optionally as of a cutoff date.
+    - `reconcile_account`: Reconcile an account as of a date against a target statement balance with automatic adjustment and transaction locking (`reconciled=True`).
+  - **Transactions, Splits, Transfers & Bulk Import**:
+    - `get_transactions`: Search, filter, and paginate (`offset`, `limit`) transactions with automatic aggregations by category (`by_category`) and month (`by_month`).
+    - `create_transaction`: Register single or split (`splits`) expenses/income with payee, category, cleared, and reconciled flags.
+    - `update_transaction`: Update date, account, amount, payee, category, notes, cleared, reconciled, or child `splits`.
+    - `delete_transaction`: Soft-delete transactions (automatically cleaning up child splits or linked transfer peers).
+    - `create_transfer`: Create linked double-entry transfers between accounts.
+    - `import_transactions`: Bulk import transactions with native deduplication (`imported_id` and ±7 day fuzzy matching).
+  - **Categories, Category Groups & Payees**:
+    - `get_categories`, `create_category`, `update_category`, `delete_category` (with optional transaction reassignment).
+    - `create_category_group`, `update_category_group`, `delete_category_group`.
+    - `get_payees`, `create_payee`, `update_payee`, `delete_payee`, `merge_payees`.
+  - **Budget & Sync**:
+    - `get_budget_month`: Monthly budget breakdown (budgeted, spent, and available balances).
+    - `set_budget_amount`: Assign or update monthly budget allocations.
+    - `sync_budget`: Force an immediate incremental sync.
 
 ---
 
