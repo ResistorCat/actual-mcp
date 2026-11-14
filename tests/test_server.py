@@ -3,7 +3,14 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
-from actual.database import Accounts, Categories, CategoryGroups, Payees
+from actual.database import (
+    Accounts,
+    Categories,
+    CategoryGroups,
+    Payees,
+    Preferences,
+    ZeroBudgetMonths,
+)
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from sqlmodel import Session, SQLModel, create_engine
@@ -169,6 +176,7 @@ async def test_mcp_tools_registered():
         "merge_payees",
         "get_budget_month",
         "set_budget_amount",
+        "transfer_budget",
         "get_transactions",
         "create_transaction",
         "update_transaction",
@@ -607,3 +615,191 @@ def test_resolve_budget_file():
 
     with pytest.raises(ValueError, match="No active budget files found"):
         resolve_budget_file("any", [])
+
+
+def test_monthly_budget_to_budget_income_and_carryover(mock_client: ActualBudgetClient):
+    c = mock_client
+    c.create_category(name="Salary", group="Income", is_income=True)
+    c.create_category(name="Bonus", group="Income", is_income=True)
+    c.create_category(name="Groceries", group="Living")
+    c.create_category(name="Dining", group="Living")
+    c.create_category(name="Emergency", group="Living")
+    c.create_account(name="Checking", initial_balance=0.0)
+
+    # Empty month returns zeros with all categories
+    empty_res = c.get_monthly_budget(month="2026-09")
+    assert empty_res["month"] == "2026-09"
+    assert empty_res["budget_type"] == "envelope"
+    assert empty_res["to_budget"] == 0.0
+    assert empty_res["total_income"] == 0.0
+    assert len(empty_res["budgets"]) == 3
+
+    # Month 1 (2026-10): Receive 2000 income, budget 500 Groceries, spend 300 Groceries,
+    # overspend 40 on unbudgeted Dining, and hold 200 for next month.
+    c.add_transaction(
+        date="2026-10-05",
+        account="Checking",
+        amount=2000.0,
+        payee="Employer",
+        category="Salary",
+    )
+    c.add_transaction(
+        date="2026-10-12",
+        account="Checking",
+        amount=-300.0,
+        payee="Market",
+        category="Groceries",
+    )
+    c.add_transaction(
+        date="2026-10-18",
+        account="Checking",
+        amount=-40.0,
+        payee="Cafe",
+        category="Dining",
+    )
+    c.set_category_budget(month="2026-10", category="Groceries", amount=500.0)
+    mock_client._actual.session.add(ZeroBudgetMonths(id="2026-10", buffered=20000))
+    mock_client._actual.session.flush()
+
+    oct_res = c.get_monthly_budget(month="2026-10")
+    assert oct_res["month"] == "2026-10"
+    assert oct_res["total_income"] == 2000.0
+    assert oct_res["available_funds"] == 2000.0
+    assert oct_res["total_budgeted"] == 500.0
+    assert oct_res["for_next_month"] == 200.0
+    # 2000 income - 500 budgeted - 200 held for next month = 1300 to budget
+    assert oct_res["to_budget"] == 1300.0
+    assert oct_res["total_spent"] == -340.0
+    assert oct_res["overspent"] == -40.0
+
+    oct_income = {item["category_name"]: item["received"] for item in oct_res["income_categories"]}
+    assert oct_income["Salary"] == 2000.0
+    assert oct_income["Bonus"] == 0.0
+
+    oct_cats = {item["category_name"]: item for item in oct_res["budgets"]}
+    assert oct_cats["Groceries"]["available"] == 200.0
+    assert oct_cats["Dining"]["budgeted"] == 0.0
+    assert oct_cats["Dining"]["spent"] == -40.0
+    assert oct_cats["Dining"]["available"] == -40.0
+
+    # Month 2 (2026-11): Receive 500 Bonus, budget 400 Groceries
+    c.add_transaction(
+        date="2026-11-02",
+        account="Checking",
+        amount=500.0,
+        payee="Employer",
+        category="Bonus",
+    )
+    c.set_category_budget(month="2026-11", category="Groceries", amount=400.0)
+
+    nov_res = c.get_monthly_budget(month="2026-11")
+    assert nov_res["total_income"] == 500.0
+    # from_last_month = Oct to_budget (1300) + Oct for_next_month (200) = 1500
+    assert nov_res["from_last_month"] == 1500.0
+    assert nov_res["available_funds"] == 2000.0
+    assert nov_res["last_month_overspent"] == -40.0
+    # to_budget = 2000 available_funds - 400 budgeted + (-40) last_month_overspent = 1560
+    assert nov_res["to_budget"] == 1560.0
+
+    nov_cats = {item["category_name"]: item for item in nov_res["budgets"]}
+    assert nov_cats["Groceries"]["available"] == 600.0  # 200 carryover + 400 budgeted
+    assert nov_cats["Dining"]["available"] == 0.0  # non-carryover negative reset
+
+
+def test_monthly_budget_tracking_mode(mock_client: ActualBudgetClient):
+    c = mock_client
+    s = mock_client._actual.session
+    s.add(Preferences(id="budgetType", value="report"))
+    s.flush()
+
+    c.create_category(name="Salary", group="Income", is_income=True)
+    c.create_category(name="Rent", group="Housing")
+    c.create_account(name="Checking", initial_balance=0.0)
+
+    c.add_transaction(
+        date="2026-11-01",
+        account="Checking",
+        amount=3000.0,
+        payee="Employer",
+        category="Salary",
+    )
+    c.add_transaction(
+        date="2026-11-03",
+        account="Checking",
+        amount=-1200.0,
+        payee="Landlord",
+        category="Rent",
+    )
+    c.set_category_budget(month="2026-11", category="Rent", amount=1200.0)
+
+    res = c.get_monthly_budget(month="2026-11")
+    assert res["budget_type"] == "tracking"
+    assert res["to_budget"] is None
+    assert res["total_income"] == 3000.0
+    assert res["total_spent"] == -1200.0
+    assert res["overspent"] == 1800.0
+
+
+def test_transfer_budget_between_categories(mock_client: ActualBudgetClient):
+    c = mock_client
+    c.create_category(name="Salary", group="Income", is_income=True)
+    c.create_category(name="Groceries", group="Living")
+    c.create_category(name="Dining", group="Living")
+    c.create_category(name="Fun", group="Living")
+    c.create_account(name="Checking", initial_balance=0.0)
+
+    c.add_transaction(
+        date="2026-10-01",
+        account="Checking",
+        amount=1000.0,
+        payee="Employer",
+        category="Salary",
+    )
+    c.set_category_budget(month="2026-10", category="Groceries", amount=300.0)
+    c.set_category_budget(month="2026-11", category="Dining", amount=100.0)
+
+    before = c.get_monthly_budget(month="2026-11")
+    assert before["to_budget"] == 600.0
+
+    # Move 75 from Groceries (which has 300 carryover, 0 budgeted in Nov) to Fun (0 budgeted)
+    tr1 = c.transfer_budget(
+        month="2026-11",
+        source_category="Groceries",
+        dest_category="Fun",
+        amount=75.0,
+    )
+    assert tr1["month"] == "2026-11"
+    assert tr1["amount"] == 75.0
+    assert tr1["source_category"]["previous_budgeted"] == 0.0
+    assert tr1["source_category"]["budgeted"] == -75.0
+    assert tr1["source_category"]["available"] == 225.0
+    assert tr1["dest_category"]["previous_budgeted"] == 0.0
+    assert tr1["dest_category"]["budgeted"] == 75.0
+    assert tr1["dest_category"]["available"] == 75.0
+    assert tr1["to_budget"] == 600.0
+
+    # Move 40 from Dining (100 budgeted) to Fun (75 budgeted)
+    tr2 = c.transfer_budget(
+        month="2026-11",
+        source_category="Dining",
+        dest_category="Fun",
+        amount=40.0,
+    )
+    assert tr2["source_category"]["budgeted"] == 60.0
+    assert tr2["dest_category"]["budgeted"] == 115.0
+    assert tr2["to_budget"] == 600.0
+
+    # Validation errors
+    with pytest.raises(ValueError, match="positive number"):
+        c.transfer_budget(month="2026-11", source_category="Dining", dest_category="Fun", amount=0.0)
+    with pytest.raises(ValueError, match="positive number"):
+        c.transfer_budget(month="2026-11", source_category="Dining", dest_category="Fun", amount=-10.0)
+    with pytest.raises(ValueError, match="must be different"):
+        c.transfer_budget(month="2026-11", source_category="Dining", dest_category="dining", amount=10.0)
+    with pytest.raises(ValueError, match="income category"):
+        c.transfer_budget(month="2026-11", source_category="Salary", dest_category="Fun", amount=10.0)
+    with pytest.raises(ValueError, match="income category"):
+        c.transfer_budget(month="2026-11", source_category="Fun", dest_category="Salary", amount=10.0)
+    with pytest.raises(ValueError, match="not found"):
+        c.transfer_budget(month="2026-11", source_category="Unknown", dest_category="Fun", amount=10.0)
+

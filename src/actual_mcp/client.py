@@ -9,6 +9,7 @@ from collections import defaultdict
 from typing import Any
 
 from actual import Actual
+from actual.budgets import EnvelopeBudget, TrackingBudget, get_budget_history
 from actual.database import (
     Accounts,
     Categories,
@@ -27,8 +28,7 @@ from actual.queries import (
     create_transaction,
     create_transaction_from_ids,
     get_accounts,
-    get_accumulated_budgeted_balance,
-    get_budgets,
+    get_budget,
     get_category_groups,
     get_transactions,
     match_transaction,
@@ -1139,38 +1139,102 @@ class ActualBudgetClient:
     # 3. Budgets
     # -------------------------------------------------------------------------
 
+    def _serialize_month_budget(
+        self,
+        month_budget: EnvelopeBudget | TrackingBudget | None,
+        month_str: str,
+    ) -> dict[str, Any]:
+        if month_budget is None:
+            return {
+                "month": month_str,
+                "budget_type": "envelope",
+                "to_budget": 0.0,
+                "total_income": 0.0,
+                "available_funds": 0.0,
+                "from_last_month": 0.0,
+                "for_next_month": 0.0,
+                "last_month_overspent": 0.0,
+                "overspent": 0.0,
+                "total_budgeted": 0.0,
+                "total_spent": 0.0,
+                "total_balance": 0.0,
+                "income_categories": [],
+                "budgets": [],
+            }
+
+        items: list[dict[str, Any]] = []
+        for grp in month_budget.category_groups:
+            for cat in grp.categories:
+                items.append(
+                    {
+                        "category_id": cat.id,
+                        "category_name": cat.name or "",
+                        "group_id": grp.id,
+                        "group_name": grp.name or "",
+                        "budgeted": float(cat.budgeted),
+                        "spent": float(cat.spent),
+                        "available": float(cat.accumulated_balance),
+                        "carryover": cat.carryover,
+                        "hidden": cat.hidden,
+                    }
+                )
+
+        income_items: list[dict[str, Any]] = []
+        for grp in month_budget.income_category_groups:
+            for cat in grp.categories:
+                entry: dict[str, Any] = {
+                    "category_id": cat.id,
+                    "category_name": cat.name or "",
+                    "group_id": grp.id,
+                    "group_name": grp.name or "",
+                    "received": float(cat.received),
+                    "hidden": cat.hidden,
+                }
+                if isinstance(month_budget, TrackingBudget):
+                    entry["budgeted"] = float(cat.budgeted)
+                income_items.append(entry)
+
+        if isinstance(month_budget, EnvelopeBudget):
+            return {
+                "month": month_str,
+                "budget_type": "envelope",
+                "to_budget": float(month_budget.to_budget),
+                "total_income": float(month_budget.received),
+                "available_funds": float(month_budget.available_funds),
+                "from_last_month": float(month_budget.from_last_month),
+                "for_next_month": float(month_budget.for_next_month),
+                "last_month_overspent": float(month_budget.last_month_overspent),
+                "overspent": float(month_budget.overspent),
+                "total_budgeted": float(month_budget.budgeted),
+                "total_spent": float(month_budget.spent),
+                "total_balance": float(month_budget.accumulated_balance),
+                "income_categories": income_items,
+                "budgets": items,
+            }
+
+        return {
+            "month": month_str,
+            "budget_type": "tracking",
+            "to_budget": None,
+            "total_income": float(month_budget.received),
+            "budgeted_income": float(month_budget.budgeted_income),
+            "overspent": float(month_budget.overspent),
+            "total_budgeted": float(month_budget.budgeted),
+            "total_spent": float(month_budget.spent),
+            "total_balance": float(month_budget.accumulated_balance),
+            "income_categories": income_items,
+            "budgets": items,
+        }
+
     def get_monthly_budget(self, month: str | None = None) -> dict[str, Any]:
         m_date = parse_month(month)
         month_str = m_date.strftime("%Y-%m")
         with self._lock:
             actual = self._get_actual()
             actual.sync()
-            budgets = get_budgets(actual.session, month=m_date)
-            items = []
-            for b in budgets:
-                cat_name = b.category.name if b.category else ""
-                try:
-                    available = float(
-                        get_accumulated_budgeted_balance(actual.session, m_date, b.category_id)
-                    )
-                except Exception:  # noqa: BLE001
-                    available = float(b.get_amount() + b.balance)
-
-                items.append(
-                    {
-                        "category_id": b.category_id,
-                        "category_name": cat_name,
-                        "budgeted": float(b.get_amount()),
-                        "spent": float(b.balance),
-                        "available": available,
-                        "carryover": bool(b.carryover),
-                    }
-                )
-
-            return {
-                "month": month_str,
-                "budgets": items,
-            }
+            history = get_budget_history(actual.session, until=m_date)
+            month_budget = history.from_month(m_date)
+            return self._serialize_month_budget(month_budget, month_str)
 
     def set_category_budget(
         self,
@@ -1197,6 +1261,10 @@ class ActualBudgetClient:
                 amount=amount_dec,
                 carryover=carryover,
             )
+            if carryover is not None:
+                budget.carryover = int(carryover)
+                actual.session.add(budget)
+            actual.session.flush()
             actual.commit()
 
             return {
@@ -1205,6 +1273,86 @@ class ActualBudgetClient:
                 "month": m_date.strftime("%Y-%m"),
                 "budgeted": float(budget.get_amount()),
                 "carryover": bool(budget.carryover),
+            }
+
+    def transfer_budget(
+        self,
+        source_category: str,
+        dest_category: str,
+        amount: float,
+        month: str | None = None,
+    ) -> dict[str, Any]:
+        amount_dec = decimal.Decimal(str(amount))
+        if amount_dec <= 0:
+            raise ValueError("Transfer amount must be a positive number.")
+
+        m_date = parse_month(month)
+        month_str = m_date.strftime("%Y-%m")
+
+        with self._lock:
+            actual = self._get_actual()
+            actual.sync()
+
+            src_cat = resolve_category(actual.session, source_category)
+            dst_cat = resolve_category(actual.session, dest_category)
+            if not src_cat:
+                raise ValueError(f"Category '{source_category}' not found.")
+            if not dst_cat:
+                raise ValueError(f"Category '{dest_category}' not found.")
+
+            if src_cat.id == dst_cat.id:
+                raise ValueError("Source and destination categories must be different.")
+
+            if src_cat.is_income or (src_cat.group and src_cat.group.is_income):
+                raise ValueError(f"Cannot transfer budget from income category '{src_cat.name}'.")
+            if dst_cat.is_income or (dst_cat.group and dst_cat.group.is_income):
+                raise ValueError(f"Cannot transfer budget to income category '{dst_cat.name}'.")
+
+            src_budget = get_budget(actual.session, m_date, src_cat)
+            dst_budget = get_budget(actual.session, m_date, dst_cat)
+
+            src_prev = src_budget.get_amount() if src_budget else decimal.Decimal(0)
+            dst_prev = dst_budget.get_amount() if dst_budget else decimal.Decimal(0)
+
+            src_new = src_prev - amount_dec
+            dst_new = dst_prev + amount_dec
+
+            create_budget(actual.session, month=m_date, category=src_cat, amount=src_new)
+            create_budget(actual.session, month=m_date, category=dst_cat, amount=dst_new)
+            actual.session.flush()
+            actual.commit()
+
+            history = get_budget_history(actual.session, until=m_date)
+            month_budget = history.from_month(m_date)
+            src_info = month_budget.from_category(src_cat) if month_budget else None
+            dst_info = month_budget.from_category(dst_cat) if month_budget else None
+
+            return {
+                "month": month_str,
+                "amount": float(amount_dec),
+                "source_category": {
+                    "category_id": src_cat.id,
+                    "category_name": src_cat.name or "",
+                    "previous_budgeted": float(src_prev),
+                    "budgeted": float(src_new),
+                    "spent": float(src_info.spent) if src_info else 0.0,
+                    "available": float(src_info.accumulated_balance)
+                    if src_info
+                    else float(src_new),
+                },
+                "dest_category": {
+                    "category_id": dst_cat.id,
+                    "category_name": dst_cat.name or "",
+                    "previous_budgeted": float(dst_prev),
+                    "budgeted": float(dst_new),
+                    "spent": float(dst_info.spent) if dst_info else 0.0,
+                    "available": float(dst_info.accumulated_balance)
+                    if dst_info
+                    else float(dst_new),
+                },
+                "to_budget": float(month_budget.to_budget)
+                if isinstance(month_budget, EnvelopeBudget)
+                else None,
             }
 
     # -------------------------------------------------------------------------

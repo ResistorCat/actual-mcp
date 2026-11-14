@@ -367,7 +367,7 @@ def merge_payees(
 
 @mcp.tool
 def get_budget_month(month: str | None = None) -> dict[str, Any]:
-    """Get the budget summary for a specific month, including budgeted, spent, and available balances.
+    """Get the budget summary for a specific month, including to-be-budgeted ('to_budget'), received income ('total_income' and 'income_categories'), carryover, and per-category budgeted, spent, and available balances.
 
     Args:
         month: Month in 'YYYY-MM' format (e.g. '2026-11'). Defaults to the current month if omitted.
@@ -387,7 +387,7 @@ def set_budget_amount(
     Args:
         month: Month in 'YYYY-MM' format (e.g. '2026-11').
         category: Category name or UUID.
-        amount: Budgeted amount (positive float).
+        amount: Budgeted amount for the month (can be 0 or negative to release carryover funds back to 'to_budget').
         carryover: Whether to carry over overspending/surplus to the next month (optional).
     """
     return client.set_category_budget(
@@ -395,6 +395,29 @@ def set_budget_amount(
         category=category,
         amount=amount,
         carryover=carryover,
+    )
+
+
+@mcp.tool
+def transfer_budget(
+    source_category: str,
+    dest_category: str,
+    amount: float,
+    month: str | None = None,
+) -> dict[str, Any]:
+    """Move (transfer) budgeted funds from one category to another within a given month without changing 'to_budget'.
+
+    Args:
+        source_category: Category name or UUID to move funds from (budgeted decreases by amount).
+        dest_category: Category name or UUID to move funds to (budgeted increases by amount).
+        amount: Positive amount to move between categories.
+        month: Month in 'YYYY-MM' format (e.g. '2026-11'). Defaults to the current month if omitted.
+    """
+    return client.transfer_budget(
+        source_category=source_category,
+        dest_category=dest_category,
+        amount=amount,
+        month=month,
     )
 
 

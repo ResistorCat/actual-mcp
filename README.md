@@ -32,8 +32,9 @@ Designed for deployment on Docker / Coolify with built-in Bearer authentication,
     - `create_category_group`, `update_category_group`, `delete_category_group`.
     - `get_payees`, `create_payee`, `update_payee`, `delete_payee`, `merge_payees`.
   - **Budget & Sync**:
-    - `get_budget_month`: Monthly budget breakdown (budgeted, spent, and available balances).
+    - `get_budget_month`: Monthly budget breakdown including to-be-budgeted (`to_budget`), received income (`total_income`, `income_categories`), carryover (`from_last_month`, `for_next_month`), and per-category budgeted, spent, and available balances.
     - `set_budget_amount`: Assign or update monthly budget allocations.
+    - `transfer_budget`: Move budgeted funds between two categories within a month without changing `to_budget`.
     - `sync_budget`: Force an immediate incremental sync.
 
 ---
